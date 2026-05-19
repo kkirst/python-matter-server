@@ -97,6 +97,12 @@ NODE_PING_TIMEOUT = 10
 NODE_PING_TIMEOUT_BATTERY_POWERED = 60
 NODE_MDNS_SUBSCRIPTION_RETRY_TIMEOUT = 30 * 60
 CUSTOM_ATTRIBUTES_POLLER_INTERVAL = 30
+# Bound on how long send_device_command will stall waiting for an offline node
+# to become available after emitting NODE_COMMAND_SENT. Sized below the typical
+# voice-agent ceiling (~5-6s for Alexa) so that an intercede-and-retry flow
+# (e.g. a Z-Wave bridge daemon closing a power relay in response to the event)
+# still completes inside the caller's timeout budget.
+NODE_COMMAND_INTERCEDE_TIMEOUT = 5.0
 
 MDNS_TYPE_OPERATIONAL_NODE = "_matter._tcp.local."
 MDNS_TYPE_COMMISSIONABLE_NODE = "_matterc._udp.local."
@@ -697,11 +703,56 @@ class MatterDeviceController:
         interaction_timeout_ms: int | None = None,
     ) -> Any:
         """Send a command to a Matter node/device."""
-        if (node := self._nodes.get(node_id)) is None or not node.available:
-            raise NodeNotReady(f"Node {node_id} is not (yet) available.")
         cluster_cls: Cluster = ALL_CLUSTERS[cluster_id]
         command_cls = getattr(cluster_cls.Commands, command_name)
         command = dataclass_from_dict(command_cls, payload, allow_sdk_types=True)
+
+        # Fork extension: emit NODE_COMMAND_SENT before the availability gate so
+        # that external subscribers (e.g. a Z-Wave bridge daemon serving as a
+        # virtual power relay) can observe the caller's intent and intercede,
+        # even when the target node is currently offline.
+        self.server.signal_event(
+            EventType.NODE_COMMAND_SENT,
+            {
+                "node_id": node_id,
+                "endpoint_id": endpoint_id,
+                "cluster_id": cluster_id,
+                "command_name": command_name,
+                "payload": payload,
+            },
+        )
+
+        node = self._nodes.get(node_id)
+        if node is None or not node.available:
+            # Stall briefly to give an intercede-and-power-on flow a chance to
+            # complete: a subscriber may close a relay in response to the event
+            # above, and the bulb will then re-resolve over mDNS and flip
+            # node.available=True (firing NODE_UPDATED). If that happens inside
+            # the timeout we proceed with the original send; otherwise we
+            # surface NodeNotReady to the caller as before.
+            ready_evt = asyncio.Event()
+
+            def _watch_for_ready(evt: EventType, data: Any) -> None:
+                if evt is not EventType.NODE_UPDATED:
+                    return
+                n = self._nodes.get(node_id)
+                if n is not None and n.available:
+                    ready_evt.set()
+
+            unsub = self.server.subscribe(_watch_for_ready)
+            try:
+                await asyncio.wait_for(
+                    ready_evt.wait(),
+                    timeout=NODE_COMMAND_INTERCEDE_TIMEOUT,
+                )
+            except TimeoutError:
+                raise NodeNotReady(f"Node {node_id} is not (yet) available.")
+            finally:
+                unsub()
+            node = self._nodes.get(node_id)
+            if node is None or not node.available:
+                raise NodeNotReady(f"Node {node_id} is not (yet) available.")
+
         if node_id >= TEST_NODE_START:
             LOGGER.debug(
                 "send_device_command called for test node %s on endpoint_id: %s - "
