@@ -23,6 +23,7 @@ class EventType(Enum):
     SERVER_INFO_UPDATED = "server_info_updated"
     ENDPOINT_ADDED = "endpoint_added"
     ENDPOINT_REMOVED = "endpoint_removed"
+    NODE_COMMAND_SENT = "node_command_sent"
 
 
 class APICommand(str, Enum):
