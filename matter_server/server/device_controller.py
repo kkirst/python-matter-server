@@ -857,11 +857,52 @@ class MatterDeviceController:
         value: Any,
     ) -> Any:
         """Write an attribute(value) on a target node."""
-        if (node := self._nodes.get(node_id)) is None or not node.available:
-            raise NodeNotReady(f"Node {node_id} is not (yet) available.")
         endpoint_id, cluster_id, attribute_id = parse_attribute_path(attribute_path)
         if endpoint_id is None:
             raise InvalidArguments(f"Invalid attribute path: {attribute_path}")
+        # Fork extension: emit NODE_COMMAND_SENT for attribute writes too (e.g.
+        # FanControl.FanMode is an attribute write, not a command) BEFORE the
+        # availability gate, so an external subscriber (the Z-Wave bridge daemon
+        # acting as a virtual power relay) can observe the caller's intent and
+        # intercede even when the node is offline. command_name="WriteAttribute"
+        # distinguishes it from real command sends.
+        self.server.signal_event(
+            EventType.NODE_COMMAND_SENT,
+            {
+                "node_id": node_id,
+                "endpoint_id": endpoint_id,
+                "cluster_id": cluster_id,
+                "command_name": "WriteAttribute",
+                "payload": {"attribute_id": attribute_id, "value": value},
+            },
+        )
+        node = self._nodes.get(node_id)
+        if node is None or not node.available:
+            # Stall (mirrors send_device_command): give an intercede-and-power-on
+            # flow a chance to bring the node online within the timeout, then
+            # proceed; otherwise surface NodeNotReady as before.
+            ready_evt = asyncio.Event()
+
+            def _watch_for_ready(evt: EventType, data: Any) -> None:
+                if evt is not EventType.NODE_UPDATED:
+                    return
+                n = self._nodes.get(node_id)
+                if n is not None and n.available:
+                    ready_evt.set()
+
+            unsub = self.server.subscribe(_watch_for_ready)
+            try:
+                await asyncio.wait_for(
+                    ready_evt.wait(),
+                    timeout=NODE_COMMAND_INTERCEDE_TIMEOUT,
+                )
+            except TimeoutError:
+                raise NodeNotReady(f"Node {node_id} is not (yet) available.")
+            finally:
+                unsub()
+            node = self._nodes.get(node_id)
+            if node is None or not node.available:
+                raise NodeNotReady(f"Node {node_id} is not (yet) available.")
         attribute = cast(
             Clusters.ClusterAttributeDescriptor,
             ALL_ATTRIBUTES[cluster_id][attribute_id](),
