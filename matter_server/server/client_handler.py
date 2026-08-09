@@ -18,6 +18,7 @@ from ..common.errors import InvalidArguments, InvalidCommand, MatterError
 from ..common.helpers.api import parse_arguments
 from ..common.helpers.util import dataclass_from_dict
 from ..common.models import (
+    FORK_ONLY_EVENTS,
     APICommand,
     CommandMessage,
     ErrorResultMessage,
@@ -62,6 +63,8 @@ class WebsocketClientHandler:
         self._writer_task: asyncio.Task | None = None
         self._logger = WebSocketLogAdapter(LOGGER, {"connid": id(self)})
         self._unsub_callback: Callable | None = None
+        # Fork extension: this connection has asked for fork-only events.
+        self._custom_events = False
 
     async def disconnect(self) -> None:
         """Disconnect client."""
@@ -156,6 +159,16 @@ class WebsocketClientHandler:
             self._handle_start_listening_command(msg)
             return
 
+        # Fork extension: handled here rather than as a normal @api_command because it
+        # is per-CONNECTION state, and api_command handlers are registered on the
+        # server and never see which client called them. Safe in either order relative
+        # to start_listening: the flag is read at emit time.
+        if msg.command == APICommand.SUBSCRIBE_CUSTOM_EVENTS:
+            self._custom_events = True
+            self._logger.debug("Client opted in to fork-only events")
+            self._send_message(SuccessResultMessage(msg.message_id, None))
+            return
+
         handler = self.server.command_handlers.get(msg.command)
 
         if handler is None:
@@ -179,6 +192,11 @@ class WebsocketClientHandler:
         self._send_message(SuccessResultMessage(msg.message_id, all_nodes))
 
         def handle_event(evt: EventType, data: Any) -> None:
+            # Fork extension: withhold fork-only events from clients that never asked
+            # for them, so an upstream client (Home Assistant) is not handed an event
+            # its EventType enum cannot represent.
+            if evt in FORK_ONLY_EVENTS and not self._custom_events:
+                return
             self._send_message(EventMessage(event=evt, data=data))
 
         self._unsub_callback = self.server.subscribe(handle_event)

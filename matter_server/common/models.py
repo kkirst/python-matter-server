@@ -54,7 +54,17 @@ class APICommand(str, Enum):
     SET_DEFAULT_FABRIC_LABEL = "set_default_fabric_label"
     SET_ACL_ENTRY = "set_acl_entry"
     SET_NODE_BINDING = "set_node_binding"
+    # Fork extension: opt in to fork-only events (see FORK_ONLY_EVENTS).
+    SUBSCRIBE_CUSTOM_EVENTS = "subscribe_custom_events"
 
+
+# Fork extension: events this fork emits that upstream clients do not know about.
+# Home Assistant ships its own upstream copy of the client, whose EventType enum has
+# no such member; delivering one makes client.py::_signal_event evaluate `.value` on a
+# plain str, which raises AttributeError out of start_listening and tears down the
+# connection. So these are delivered ONLY to clients that explicitly opt in with
+# APICommand.SUBSCRIBE_CUSTOM_EVENTS.
+FORK_ONLY_EVENTS: frozenset[EventType] = frozenset({EventType.NODE_COMMAND_SENT})
 
 EventCallBackType = Callable[[EventType, Any], None]
 
