@@ -103,6 +103,12 @@ CUSTOM_ATTRIBUTES_POLLER_INTERVAL = 30
 # (e.g. a Z-Wave bridge daemon closing a power relay in response to the event)
 # still completes inside the caller's timeout budget.
 NODE_COMMAND_INTERCEDE_TIMEOUT = 5.0
+# Power hints (fork extension). After a client reports that it just restored a
+# node's mains, node setup retries every POWER_FAST_RETRY_S instead of 60s, and
+# does not give up, for POWER_FAST_WINDOW_S. Past the window the node is back on
+# the stock path (mDNS discovery), so a hint can never leave it worse off.
+POWER_FAST_WINDOW_S = 300
+POWER_FAST_RETRY_S = 2
 
 MDNS_TYPE_OPERATIONAL_NODE = "_matter._tcp.local."
 MDNS_TYPE_COMMISSIONABLE_NODE = "_matterc._udp.local."
@@ -166,6 +172,12 @@ class MatterDeviceController:
         self._wifi_credentials_set: bool = False
         self._thread_credentials_set: bool = False
         self._setup_node_tasks = dict[int, asyncio.Task]()
+        # Fork extension: power hints. Only nodes a client has hinted appear here;
+        # every other node takes the stock code paths unchanged.
+        self._power_hints: dict[int, bool] = {}
+        self._power_fast_until: dict[int, float] = {}
+        self._power_on_at: dict[int, float] = {}
+        self._setup_node_wake: dict[int, asyncio.Event] = {}
         self._nodes_in_ota: set[int] = set()
         self._node_last_seen_on_mdns: dict[int, float] = {}
         self._nodes: dict[int, MatterNodeData] = {}
@@ -985,6 +997,76 @@ class MatterDeviceController:
             node_id, [(endpoint, Clusters.Binding.Attributes.Binding(bindings))]
         )
 
+    @api_command(APICommand.SET_NODE_POWER_HINT)
+    async def set_node_power_hint(self, node_id: int, powered: bool) -> None:
+        """Fork extension: a client that switches this node's mains reports it.
+
+        Stock recovery is blind to power. A node that was gone past
+        NODE_RESUBSCRIBE_TIMEOUT_OFFLINE loses its subscription and only comes
+        back when mDNS happens to carry its announcement to us, which on Wi-Fi
+        took 12 minutes for a bulb that was lit and associated within a minute.
+
+        powered=False: the client just cut mains. Drop the subscription and mark
+        the node unavailable now, instead of after the liveness timeout and a
+        growing resubscribe backoff.
+
+        powered=True: the client just restored mains. Set the node up again now,
+        retrying every POWER_FAST_RETRY_S for POWER_FAST_WINDOW_S.
+
+        Idempotent, and never persisted: clients re-assert after reconnecting.
+        Any sign of life (mDNS, a successful setup) overrides powered=False,
+        because the client's view of a relay can be wrong.
+        """
+        if node_id not in self._nodes:
+            raise NodeNotExists(f"Node {node_id} does not exist.")
+        node_logger = self.get_node_logger(LOGGER, node_id)
+        node = self._nodes[node_id]
+
+        if not powered:
+            already = self._power_hints.get(node_id) is False
+            self._power_hints[node_id] = False
+            self._power_fast_until.pop(node_id, None)
+            self._power_on_at.pop(node_id, None)
+            if already:
+                return
+            node_logger.info("power hint: unpowered")
+            if (
+                node.available
+                or self._chip_device_controller.node_has_subscription(node_id)
+            ):
+                await self._node_offline(node_id)
+            # a running setup loop stops at its next pass (see _setup_node);
+            # wake it so that pass is now rather than after its sleep
+            if wake := self._setup_node_wake.get(node_id):
+                wake.set()
+            return
+
+        was_unpowered = self._power_hints.pop(node_id, None) is False
+        if node.available:
+            if was_unpowered:
+                node_logger.info("power hint: powered (node already available)")
+            return
+        now = time.time()
+        if self._power_fast_until.get(node_id, 0) > now:
+            return  # already in a fast window for this power-on
+        self._power_on_at[node_id] = now
+        self._power_fast_until[node_id] = now + POWER_FAST_WINDOW_S
+        node_logger.info(
+            "power hint: powered, fast setup every %ss for %ss",
+            POWER_FAST_RETRY_S,
+            POWER_FAST_WINDOW_S,
+        )
+        if self._chip_device_controller.node_has_subscription(node_id):
+            # a subscription stuck in resubscribe backoff: start over instead of
+            # waiting out whatever interval the SDK has grown to
+            await self._chip_device_controller.shutdown_subscription(node_id)
+        if node_id in self._setup_node_tasks:
+            # a stock setup loop exists; cut its 60s sleep short
+            if wake := self._setup_node_wake.get(node_id):
+                wake.set()
+        else:
+            self._setup_node_create_task(node_id)
+
     @api_command(APICommand.PING_NODE)
     async def ping_node(self, node_id: int, attempts: int = 1) -> NodePingResult:
         """Ping node on the currently known IP-address(es)."""
@@ -1562,16 +1644,42 @@ class MatterDeviceController:
             raise NodeNotExists(f"Node {node_id} does not exist.")
 
         node_logger = self.get_node_logger(LOGGER, node_id)
+        # Fork extension: power hints can shorten the retry sleep (fast window),
+        # wake it early (power restored mid-sleep) or end the loop (power cut).
+        # With no hint for this node, every branch below reduces to stock.
+        wake = self._setup_node_wake.setdefault(node_id, asyncio.Event())
 
         while True:
+            if self._power_hints.get(node_id) is False:
+                node_logger.info("power hint: unpowered, stopping node setup")
+                break
             try:
                 await self._setup_node_try_once(node_logger, node_id)
+                if (on_at := self._power_on_at.pop(node_id, None)) is not None:
+                    node_logger.info(
+                        "power hint: reconnected %.1fs after power-on",
+                        time.time() - on_at,
+                    )
+                self._power_fast_until.pop(node_id, None)
                 break
-            except (NodeNotResolving, NodeInterviewFailed, ChipStackError):
-                if (
+            except (NodeNotResolving, NodeInterviewFailed, ChipStackError) as err:
+                fast = self._power_fast_until.get(node_id, 0) > time.time()
+                if fast:
+                    node_logger.info(
+                        "power hint: setup attempt failed %.1fs after power-on: %s",
+                        time.time() - self._power_on_at.get(node_id, time.time()),
+                        err.__class__.__name__,
+                    )
+                elif (
                     time.time() - self._node_last_seen_on_mdns.get(node_id, 0)
                     > NODE_MDNS_SUBSCRIPTION_RETRY_TIMEOUT
                 ):
+                    if self._power_on_at.pop(node_id, None) is not None:
+                        node_logger.warning(
+                            "power hint: no reconnect within %ss of power-on, "
+                            "falling back to mDNS discovery",
+                            POWER_FAST_WINDOW_S,
+                        )
                     # NOTE: assume the node will be picked up by mdns discovery later
                     # automatically when it becomes available again.
                     node_logger.warning(
@@ -1580,8 +1688,17 @@ class MatterDeviceController:
                     )
                     break
 
-            node_logger.info("Retrying node setup in 60 seconds...")
-            await asyncio.sleep(60)
+            if self._power_fast_until.get(node_id, 0) > time.time():
+                delay: float = POWER_FAST_RETRY_S
+            else:
+                node_logger.info("Retrying node setup in 60 seconds...")
+                delay = 60
+            # a wake set while the attempt above was running is honoured at once
+            try:
+                await asyncio.wait_for(wake.wait(), delay)
+            except TimeoutError:
+                pass
+            wake.clear()
 
     def _setup_node_create_task(self, node_id: int) -> asyncio.Task | None:
         """Create a task for setting up a node with retry."""
@@ -1687,6 +1804,11 @@ class MatterDeviceController:
             return  # this should not happen, but guard just in case
 
         self._node_last_seen_on_mdns[node_id] = time.time()
+
+        # Fork extension: a node heard on mDNS has power, whatever a client said.
+        if self._power_hints.get(node_id) is False:
+            node_logger.info("power hint: heard on mDNS, clearing 'unpowered'")
+            self._power_hints.pop(node_id, None)
 
         # we only treat UPDATE state changes as ADD if the node is marked as
         # unavailable to ensure we catch a node being operational

@@ -56,6 +56,9 @@ class APICommand(str, Enum):
     SET_NODE_BINDING = "set_node_binding"
     # Fork extension: opt in to fork-only events (see FORK_ONLY_EVENTS).
     SUBSCRIBE_CUSTOM_EVENTS = "subscribe_custom_events"
+    # Fork extension: a client that switches a node's mains tells us when it cut
+    # or restored power (see MatterDeviceController.set_node_power_hint).
+    SET_NODE_POWER_HINT = "set_node_power_hint"
 
 
 # Fork extension: events this fork emits that upstream clients do not know about.
